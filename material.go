@@ -75,10 +75,10 @@ func generateMaterial(alg Algorithm) (privateKey, publicKey []byte, err error) {
 	case ECDSAP384SHA384:
 		return generateECDSA(elliptic.P384())
 
-	case RSAPSS2048SHA256:
-		return generateRSAPSS(rsaPSS2048Bits)
-	case RSAPSS3072SHA256:
-		return generateRSAPSS(rsaPSS3072Bits)
+	case RSAPKCS1v15_2048_SHA256, RSAPSS2048SHA256:
+		return generateRSA(rsaPSS2048Bits)
+	case RSAPKCS1v15_3072_SHA256, RSAPSS3072SHA256:
+		return generateRSA(rsaPSS3072Bits)
 
 	default:
 		return nil, nil, fmt.Errorf("%w: unsupported algorithm %q", ErrInvalid, alg)
@@ -101,7 +101,7 @@ func generateECDSA(curve elliptic.Curve) (privateKey, publicKey []byte, err erro
 	return privBytes, pubBytes, nil
 }
 
-func generateRSAPSS(bits int) (privateKey, publicKey []byte, err error) {
+func generateRSA(bits int) (privateKey, publicKey []byte, err error) {
 	priv, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
 		return nil, nil, err
@@ -133,7 +133,9 @@ func parsePrivateKey(alg Algorithm, der []byte) (any, error) {
 		out := make([]byte, len(der))
 		copy(out, der)
 		return out, nil
-	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384, RSAPSS2048SHA256, RSAPSS3072SHA256:
+	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384,
+		RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256,
+		RSAPSS2048SHA256, RSAPSS3072SHA256:
 		key, err := x509.ParsePKCS8PrivateKey(der)
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse private key: %v", ErrInvalid, err)
@@ -171,7 +173,9 @@ func validateKeyPair(alg Algorithm, privateDER, publicDER []byte) error {
 
 func parsePublicKey(alg Algorithm, der []byte) (crypto.PublicKey, error) {
 	switch alg {
-	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384, RSAPSS2048SHA256, RSAPSS3072SHA256:
+	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384,
+		RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256,
+		RSAPSS2048SHA256, RSAPSS3072SHA256:
 		key, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse public key: %v", ErrInvalid, err)
@@ -201,12 +205,12 @@ func checkPrivateKeyType(alg Algorithm, key any) error {
 		if !ok || k.Curve != elliptic.P384() {
 			return fmt.Errorf("%w: expected P-384 ECDSA private key", ErrInvalid)
 		}
-	case RSAPSS2048SHA256:
+	case RSAPKCS1v15_2048_SHA256, RSAPSS2048SHA256:
 		k, ok := key.(*rsa.PrivateKey)
 		if !ok || k.N.BitLen() != rsaPSS2048Bits {
 			return fmt.Errorf("%w: expected RSA-2048 private key", ErrInvalid)
 		}
-	case RSAPSS3072SHA256:
+	case RSAPKCS1v15_3072_SHA256, RSAPSS3072SHA256:
 		k, ok := key.(*rsa.PrivateKey)
 		if !ok || k.N.BitLen() != rsaPSS3072Bits {
 			return fmt.Errorf("%w: expected RSA-3072 private key", ErrInvalid)
@@ -231,12 +235,12 @@ func checkPublicKeyType(alg Algorithm, key crypto.PublicKey) error {
 		if !ok || k.Curve != elliptic.P384() {
 			return fmt.Errorf("%w: expected P-384 ECDSA public key", ErrInvalid)
 		}
-	case RSAPSS2048SHA256:
+	case RSAPKCS1v15_2048_SHA256, RSAPSS2048SHA256:
 		k, ok := key.(*rsa.PublicKey)
 		if !ok || k.N.BitLen() != rsaPSS2048Bits {
 			return fmt.Errorf("%w: expected RSA-2048 public key", ErrInvalid)
 		}
-	case RSAPSS3072SHA256:
+	case RSAPKCS1v15_3072_SHA256, RSAPSS3072SHA256:
 		k, ok := key.(*rsa.PublicKey)
 		if !ok || k.N.BitLen() != rsaPSS3072Bits {
 			return fmt.Errorf("%w: expected RSA-3072 public key", ErrInvalid)
@@ -249,7 +253,9 @@ func signerHash(alg Algorithm) (crypto.Hash, error) {
 	switch alg {
 	case Ed25519:
 		return 0, nil
-	case ECDSAP256SHA256, RSAPSS2048SHA256, RSAPSS3072SHA256:
+	case ECDSAP256SHA256,
+		RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256,
+		RSAPSS2048SHA256, RSAPSS3072SHA256:
 		return crypto.SHA256, nil
 	case ECDSAP384SHA384:
 		return crypto.SHA384, nil

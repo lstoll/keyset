@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -330,6 +331,39 @@ func TestSignVerify(t *testing.T) {
 	}
 	if err := publicVerifier.VerifyKey(signer.KeyID(), []byte("crypto.Signer message"), sig); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRS256SignVerify(t *testing.T) {
+	algorithms := []keyset.Algorithm{
+		keyset.RSAPKCS1v15_2048_SHA256,
+		keyset.RSAPKCS1v15_3072_SHA256,
+	}
+	for _, algorithm := range algorithms {
+		t.Run(string(algorithm), func(t *testing.T) {
+			ks, err := keyset.New("jwt", algorithm, keyset.DefaultPolicy())
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer, err := ks.Signer()
+			if err != nil {
+				t.Fatal(err)
+			}
+			signature, err := signer.SignMsg([]byte("header.payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifier, err := ks.Public().Verifier()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := verifier.VerifyKey(signer.KeyID(), []byte("header.payload"), signature); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := signer.Sign(rand.Reader, make([]byte, 32), &rsa.PSSOptions{Hash: crypto.SHA256}); err == nil {
+				t.Fatal("RS256 signer accepted PSS options")
+			}
+		})
 	}
 }
 

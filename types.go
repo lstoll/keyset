@@ -14,11 +14,13 @@ const (
 	AES256GCM  Algorithm = "aes256-gcm"
 	HMACSHA256 Algorithm = "hmac-sha256"
 
-	Ed25519          Algorithm = "ed25519"
-	ECDSAP256SHA256  Algorithm = "ecdsa-p256-sha256"
-	ECDSAP384SHA384  Algorithm = "ecdsa-p384-sha384"
-	RSAPSS2048SHA256 Algorithm = "rsa-pss-2048-sha256"
-	RSAPSS3072SHA256 Algorithm = "rsa-pss-3072-sha256"
+	Ed25519                 Algorithm = "ed25519"
+	ECDSAP256SHA256         Algorithm = "ecdsa-p256-sha256"
+	ECDSAP384SHA384         Algorithm = "ecdsa-p384-sha384"
+	RSAPKCS1v15_2048_SHA256 Algorithm = "rsa-pkcs1v15-2048-sha256"
+	RSAPKCS1v15_3072_SHA256 Algorithm = "rsa-pkcs1v15-3072-sha256"
+	RSAPSS2048SHA256        Algorithm = "rsa-pss-2048-sha256"
+	RSAPSS3072SHA256        Algorithm = "rsa-pss-3072-sha256"
 )
 
 type purpose string
@@ -76,28 +78,12 @@ func (a Algorithm) purpose() (purpose, error) {
 		return purposeAEAD, nil
 	case HMACSHA256:
 		return purposeMAC, nil
-	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384, RSAPSS2048SHA256, RSAPSS3072SHA256:
+	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384,
+		RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256,
+		RSAPSS2048SHA256, RSAPSS3072SHA256:
 		return purposeSign, nil
 	default:
 		return "", fmt.Errorf("%w: unknown algorithm %q", ErrInvalid, a)
-	}
-}
-
-// JOSEAlgorithm returns the corresponding JWT/JWS alg identifier.
-func (a Algorithm) JOSEAlgorithm() (string, error) {
-	switch a {
-	case Ed25519:
-		return "EdDSA", nil
-	case ECDSAP256SHA256:
-		return "ES256", nil
-	case ECDSAP384SHA384:
-		return "ES384", nil
-	case RSAPSS2048SHA256, RSAPSS3072SHA256:
-		return "PS256", nil
-	case HMACSHA256:
-		return "HS256", nil
-	default:
-		return "", fmt.Errorf("%w: %s is not a JOSE signing algorithm", ErrInvalid, a)
 	}
 }
 

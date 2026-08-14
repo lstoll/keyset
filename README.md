@@ -8,6 +8,7 @@ Supported key types:
 - HMAC-SHA-256
 - Ed25519
 - ECDSA P-256/SHA-256 and P-384/SHA-384
+- RSA PKCS#1 v1.5 2048/SHA-256 and 3072/SHA-256 (`RS256`)
 - RSA-PSS 2048/SHA-256 and 3072/SHA-256
 
 Each keyset uses one algorithm. Keys move through `pending`, `primary`,
@@ -66,8 +67,6 @@ signature, err := signer.SignMsg(message)
 verifier, err := ks.Public().Verifier()
 err = verifier.VerifyKey(signer.KeyID(), message, signature)
 ```
-
-The `jwk` and `jws` packages provide JOSE encoding helpers.
 
 ## Persistence
 

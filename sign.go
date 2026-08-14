@@ -198,6 +198,11 @@ func checkOpts(alg Algorithm, opts crypto.SignerOpts) error {
 	if got != want {
 		return fmt.Errorf("%w: want hash %v, got %v", ErrInvalid, want, got)
 	}
+	if alg == RSAPKCS1v15_2048_SHA256 || alg == RSAPKCS1v15_3072_SHA256 {
+		if _, pss := opts.(*rsa.PSSOptions); pss {
+			return fmt.Errorf("%w: RSA PKCS1v15 signer does not accept PSS options", ErrInvalid)
+		}
+	}
 	return nil
 }
 
@@ -218,6 +223,15 @@ func signMessage(alg Algorithm, key any, random io.Reader, msg []byte, opts cryp
 		h := opts.HashFunc().New()
 		h.Write(msg)
 		return ecdsa.SignASN1(random, priv, h.Sum(nil))
+
+	case RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256:
+		priv, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, ErrInvalid
+		}
+		h := opts.HashFunc().New()
+		h.Write(msg)
+		return rsa.SignPKCS1v15(random, priv, opts.HashFunc(), h.Sum(nil))
 
 	case RSAPSS2048SHA256, RSAPSS3072SHA256:
 		priv, ok := key.(*rsa.PrivateKey)
@@ -244,6 +258,13 @@ func signDigest(alg Algorithm, key any, random io.Reader, digest []byte, opts cr
 			return nil, ErrInvalid
 		}
 		return ecdsa.SignASN1(random, priv, digest)
+
+	case RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256:
+		priv, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, ErrInvalid
+		}
+		return rsa.SignPKCS1v15(random, priv, opts.HashFunc(), digest)
 
 	case RSAPSS2048SHA256, RSAPSS3072SHA256:
 		priv, ok := key.(*rsa.PrivateKey)
@@ -281,6 +302,18 @@ func verifyWith(alg Algorithm, pubDER, msg, sig []byte, opts crypto.SignerOpts) 
 		h := opts.HashFunc().New()
 		h.Write(msg)
 		if !ecdsa.VerifyASN1(pk, h.Sum(nil), sig) {
+			return ErrVerificationFailed
+		}
+		return nil
+
+	case RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256:
+		pk, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return ErrVerificationFailed
+		}
+		h := opts.HashFunc().New()
+		h.Write(msg)
+		if err := rsa.VerifyPKCS1v15(pk, opts.HashFunc(), h.Sum(nil), sig); err != nil {
 			return ErrVerificationFailed
 		}
 		return nil
