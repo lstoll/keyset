@@ -127,6 +127,44 @@ _, err = db.ExecContext(ctx, store.Schema())
 Run `Schema()` through the application's migration system. Public-only services
 can use `sqlstore.NewPublic` without access to the keeper.
 
+## Kubernetes
+
+`k8sstore` is a separate module so client-go is not a dependency of the core
+library. It stores each keyset as a key in one Secret. Optimistic concurrency
+uses the Secret `resourceVersion`. Kubernetes limits Secrets to 1MiB of data.
+
+```go
+store, err := k8sstore.New(client, "app", "keysets", keeper)
+rotator, err := keyset.NewRotator(store,
+	keyset.WithEnsure(map[string]keyset.Spec{
+		"sessions": {Algorithm: keyset.AES256GCM, Policy: keyset.DefaultPolicy()},
+		"jwt":      {Algorithm: keyset.Ed25519, Policy: jwtPolicy},
+	}),
+)
+err = rotator.Once(ctx)
+```
+
+The caller constructs the Kubernetes client. Public-only services can use
+`k8sstore.NewPublic` without access to the keeper. Use
+`insecurecleartext.Keeper` when Kubernetes encryption at rest is enough.
+
+The store needs `get`, `create`, and `update` on that Secret:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keyset
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["keysets"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+```
+
 ## Status
 
 The API and persistence format may still change.
