@@ -14,3 +14,12 @@ updates:
         update-types:
         - "minor"
         - "patch"
+  - package-ecosystem: "gomod"
+    directory: "/k8sstore"
+    schedule:
+      interval: "weekly"
+    groups:
+      non-major-versions:
+        update-types:
+        - "minor"
+        - "patch"

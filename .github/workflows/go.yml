@@ -36,6 +36,24 @@ jobs:
       with:
         version: latest
 
+    - name: Get k8sstore dependencies
+      run: go mod download
+      working-directory: k8sstore
+
+    - name: Build k8sstore
+      run: go build ./...
+      working-directory: k8sstore
+
+    - name: Test k8sstore
+      run: go test ./...
+      working-directory: k8sstore
+
+    - name: Lint k8sstore
+      uses: golangci/golangci-lint-action@v7
+      with:
+        version: latest
+        working-directory: k8sstore
+
     # would be nice, but need to sort the import story
     # - name: Buf
     #   uses: bufbuild/buf-action@v1
