@@ -3,14 +3,14 @@ package keyset_test
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/rand"
-	"crypto/rsa"
-	"encoding/binary"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,174 +29,283 @@ func testKeeper(t *testing.T) keyset.Keeper {
 	return k
 }
 
-func TestAEADLifecycle(t *testing.T) {
+func testType(policy keyset.Policy) keyset.Type {
+	var n atomic.Int64
+	return keyset.Type{
+		Policy: policy,
+		New: func(context.Context) (keyset.Material, error) {
+			priv := make([]byte, 32)
+			if _, err := rand.Read(priv); err != nil {
+				return keyset.Material{}, err
+			}
+			id := n.Add(1)
+			return keyset.Material{
+				Private: priv,
+				Public:  []byte(fmt.Sprintf("pub-%d", id)),
+			}, nil
+		},
+	}
+}
+
+func typedIDs(policy keyset.Policy) keyset.Type {
+	var n atomic.Int64
+	return keyset.Type{
+		Policy: policy,
+		New: func(context.Context) (keyset.Material, error) {
+			id := n.Add(1)
+			return keyset.Material{
+				ID:      fmt.Sprintf("%d", id),
+				Private: []byte(fmt.Sprintf("priv-%d", id)),
+				Public:  []byte(fmt.Sprintf("pub-%d", id)),
+			}, nil
+		},
+	}
+}
+
+func newRegistry(t *testing.T, types map[string]keyset.Type) *keyset.Registry {
+	t.Helper()
+	reg, err := keyset.NewRegistry(types)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
+}
+
+func TestLifecycleAndMaterial(t *testing.T) {
 	policy := keyset.Policy{
 		Primary:   10 * time.Second,
 		Propagate: 2 * time.Second,
 		PhaseOut:  5 * time.Second,
 		Retention: 3 * time.Second,
 	}
-	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	ks, err := newAtForTest(t, "sessions", keyset.AES256GCM, policy, now)
+	typ := testType(policy)
+	ks, err := keyset.New(t.Context(), "sessions", "sessions", typ)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if ks.Type() != "sessions" || ks.Name() != "sessions" {
+		t.Fatalf("name=%q type=%q", ks.Name(), ks.Type())
+	}
+	primary, ok := ks.Primary()
+	if !ok || !primary.State.IsPrimary() || len(primary.Private) == 0 {
+		t.Fatalf("primary=%#v ok=%v", primary, ok)
+	}
+	keys := ks.Keys()
+	if len(keys) != 2 {
+		t.Fatalf("keys=%d", len(keys))
+	}
+	var pending bool
+	for _, k := range keys {
+		if k.State == keyset.StatePending && k.State.IsUsable() && !k.State.IsPrimary() {
+			pending = true
+		}
+	}
+	if !pending {
+		t.Fatal("expected a pending successor")
 	}
 
-	aead, err := ks.AEAD()
-	if err != nil {
-		t.Fatal(err)
-	}
-	kid := aead.KeyID()
-	ct, err := aead.Seal([]byte("hello"), []byte("aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	pt, err := aead.OpenKey(kid, ct, []byte("aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(pt) != "hello" {
-		t.Fatal(string(pt))
-	}
-	pt, err = aead.Open(ct, []byte("aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(pt) != "hello" {
-		t.Fatal(string(pt))
-	}
-
-	type rec struct {
-		ct  []byte
-		kid uint32
-	}
-	history := []rec{{ct, kid}}
-	end := now.Add(60 * time.Second)
+	end := time.Now().UTC().Add(60 * time.Second)
+	now := time.Now().UTC()
+	seen := map[string]bool{ks.PrimaryID(): true}
 	for now = now.Add(time.Second); now.Before(end); now = now.Add(time.Second) {
-		if _, err := ks.Rotate(now); err != nil {
+		if _, err := ks.Rotate(t.Context(), now, &typ); err != nil {
 			t.Fatal(err)
 		}
-		aead, err = ks.AEAD()
+		seen[ks.PrimaryID()] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected rotations, primaries=%d", len(seen))
+	}
+}
+
+func TestConstructorIDs(t *testing.T) {
+	ks, err := keyset.New(t.Context(), "jwt", "jwt", typedIDs(keyset.DefaultPolicy()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks.PrimaryID() != "1" {
+		t.Fatalf("primary id=%s", ks.PrimaryID())
+	}
+	got, ok := ks.Key("2")
+	if !ok || got.State != keyset.StatePending {
+		t.Fatalf("pending=%#v ok=%v", got, ok)
+	}
+
+	dup := keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New: func(context.Context) (keyset.Material, error) {
+			return keyset.Material{ID: "same", Private: []byte("x")}, nil
+		},
+	}
+	if _, err := keyset.New(t.Context(), "x", "x", dup); err == nil {
+		t.Fatal("duplicate constructor id accepted")
+	}
+}
+
+// sequentialIDs numbers keys max+1 from the ids already in the keyset, so it
+// keeps working after a reload, unlike a counter held in memory.
+func sequentialIDs(existing []string) (string, error) {
+	highest := 0
+	for _, id := range existing {
+		n, err := strconv.Atoi(id)
 		if err != nil {
-			t.Fatal(err)
+			return "", fmt.Errorf("non-numeric id %q", id)
 		}
-		ct, err = aead.Seal([]byte("ping"), []byte("aad"))
-		if err != nil {
-			t.Fatal(err)
+		highest = max(highest, n)
+	}
+	return strconv.Itoa(highest + 1), nil
+}
+
+func TestNewIDSequentialSurvivesReload(t *testing.T) {
+	typ := testType(keyset.Policy{Primary: time.Second})
+	typ.NewID = sequentialIDs
+	start := time.Now().UTC()
+	ks, err := keyset.New(t.Context(), "s", "s", typ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks.PrimaryID() != "1" {
+		t.Fatalf("primary id=%q", ks.PrimaryID())
+	}
+	blob, err := ks.Marshal(testKeeper(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := keyset.Unmarshal("s", blob, testKeeper(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loaded.Rotate(t.Context(), start.Add(2*time.Second), &typ); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PrimaryID() != "2" {
+		t.Fatalf("primary id=%q", loaded.PrimaryID())
+	}
+	if k, ok := loaded.Key("3"); !ok || k.State != keyset.StatePending {
+		t.Fatalf("pending=%#v ok=%v", k, ok)
+	}
+}
+
+func TestNewIDPrecedenceAndValidation(t *testing.T) {
+	material := func(id string) func(context.Context) (keyset.Material, error) {
+		return func(context.Context) (keyset.Material, error) {
+			return keyset.Material{ID: id, Private: []byte("x")}, nil
 		}
-		history = append(history, rec{ct, aead.KeyID()})
-		for _, r := range history {
-			if _, err := aead.OpenKey(r.kid, r.ct, []byte("aad")); err != nil {
-				if !errors.Is(err, keyset.ErrUnknownKey) && !errors.Is(err, keyset.ErrAuthenticationFailed) {
-					t.Fatal(err)
-				}
+	}
+
+	called := false
+	explicit := keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New: func(context.Context) (keyset.Material, error) {
+			if called {
+				return keyset.Material{ID: "second", Private: []byte("x")}, nil
 			}
+			called = true
+			return keyset.Material{ID: "first", Private: []byte("x")}, nil
+		},
+		NewID: func([]string) (string, error) {
+			t.Error("NewID called although Material.ID was set")
+			return "unused", nil
+		},
+	}
+	ks, err := keyset.New(t.Context(), "e", "e", explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks.PrimaryID() != "first" {
+		t.Fatalf("primary id=%q", ks.PrimaryID())
+	}
+
+	genErr := errors.New("generator broke")
+	for name, newID := range map[string]func([]string) (string, error){
+		"empty":     func([]string) (string, error) { return "", nil },
+		"too long":  func([]string) (string, error) { return strings.Repeat("x", 129), nil },
+		"duplicate": func([]string) (string, error) { return "fixed", nil },
+		"error":     func([]string) (string, error) { return "", genErr },
+	} {
+		typ := keyset.Type{Policy: keyset.DefaultPolicy(), New: material(""), NewID: newID}
+		_, err := keyset.New(t.Context(), "x", "x", typ)
+		want := keyset.ErrInvalid
+		if name == "error" {
+			want = genErr
+		}
+		if !errors.Is(err, want) {
+			t.Errorf("%s: err=%v, want %v", name, err, want)
 		}
 	}
-}
 
-func TestAEADFramingAndSizes(t *testing.T) {
-	ks, err := keyset.New("data", keyset.AES256GCM, keyset.DefaultPolicy())
+	// existing is a copy; mutating it must not affect the keyset.
+	mutating := keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New:    material(""),
+		NewID: func(existing []string) (string, error) {
+			id, err := sequentialIDs(existing)
+			for i := range existing {
+				existing[i] = "clobbered"
+			}
+			return id, err
+		},
+	}
+	ks, err = keyset.New(t.Context(), "m", "m", mutating)
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead, err := ks.AEAD()
-	if err != nil {
-		t.Fatal(err)
+	if ks.PrimaryID() != "1" {
+		t.Fatalf("primary id=%q", ks.PrimaryID())
 	}
-	if aead.NonceSize() != 12 || aead.RawOverhead() != 28 || aead.Overhead() != 33 {
-		t.Fatalf("sizes: nonce=%d raw=%d framed=%d", aead.NonceSize(), aead.RawOverhead(), aead.Overhead())
-	}
-	plaintext := []byte("hello")
-	ct, err := aead.Seal(plaintext, []byte("aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ct) != len(plaintext)+aead.Overhead() {
-		t.Fatalf("ciphertext size=%d", len(ct))
-	}
-	if got := binary.BigEndian.Uint32(ct[1:5]); got != aead.KeyID() {
-		t.Fatalf("framed key id=%d, want %d", got, aead.KeyID())
-	}
-	tampered := append([]byte(nil), ct...)
-	tampered[4] ^= 1
-	if _, err := aead.Open(tampered, []byte("aad")); err == nil {
-		t.Fatal("tampered key ID was accepted")
-	}
-	raw, err := aead.SealRaw(plaintext, []byte("aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(raw) != len(plaintext)+aead.RawOverhead() {
-		t.Fatalf("raw ciphertext size=%d", len(raw))
-	}
-	if _, err := aead.OpenRaw(raw, []byte("aad")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := aead.Open(raw, []byte("aad")); err == nil {
-		t.Fatal("unframed ciphertext accepted by Open")
+	if _, ok := ks.Key("2"); !ok {
+		t.Fatal("pending key id was clobbered")
 	}
 }
 
-func newAtForTest(t *testing.T, name string, alg keyset.Algorithm, policy keyset.Policy, now time.Time) (*keyset.Keyset, error) {
-	t.Helper()
-	store := memstore.New(testKeeper(t))
-	rot, err := keyset.NewRotator(store, keyset.WithClock(func() time.Time { return now }))
+func TestRotateRequiresConstructorToMint(t *testing.T) {
+	policy := keyset.Policy{Primary: time.Second, Propagate: 0}
+	typ := testType(policy)
+	ks, err := keyset.New(t.Context(), "s", "s", typ)
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	if err := rot.Ensure(t.Context(), name, alg, policy); err != nil {
-		return nil, err
+	blob, err := ks.Marshal(testKeeper(t))
+	if err != nil {
+		t.Fatal(err)
 	}
-	return store.Get(t.Context(), name)
+	loaded, err := keyset.Unmarshal("s", blob, testKeeper(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := loaded.Keys()
+	later := time.Now().UTC().Add(2 * time.Second)
+	changed, err := loaded.Rotate(t.Context(), later, nil)
+	if !errors.Is(err, keyset.ErrInvalid) {
+		t.Fatalf("rotate without constructor error=%v", err)
+	}
+	if changed {
+		t.Fatal("failed rotate reported a change")
+	}
+	// A failed rotate must not leave a promoted primary with no pending key.
+	if diff := keyStates(loaded.Keys()); diff != keyStates(before) {
+		t.Fatalf("failed rotate mutated keyset: before=%s after=%s", keyStates(before), diff)
+	}
+
+	// Supplying the constructor afterwards rotates normally.
+	if _, err := loaded.Rotate(t.Context(), later, &typ); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PrimaryID() == ks.PrimaryID() {
+		t.Fatal("primary was not rotated")
+	}
 }
 
-func TestBoundSnapshot(t *testing.T) {
-	policy := keyset.Policy{
-		Primary:   time.Second,
-		Propagate: 0,
-		PhaseOut:  time.Hour,
-		Retention: time.Hour,
+func keyStates(keys []keyset.Key) string {
+	var out string
+	for _, k := range keys {
+		out += k.ID + "=" + string(k.State) + ";"
 	}
-	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	ks, err := newAtForTest(t, "s", keyset.AES256GCM, policy, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aead, err := ks.AEAD()
-	if err != nil {
-		t.Fatal(err)
-	}
-	kid := aead.KeyID()
-	ct, err := aead.Seal([]byte("a"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	now = now.Add(2 * time.Second)
-	if _, err := ks.Rotate(now); err != nil {
-		t.Fatal(err)
-	}
-	if ks.PrimaryID() == kid {
-		t.Fatal("expected primary change")
-	}
-	ct2, err := aead.Seal([]byte("b"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if aead.KeyID() != kid {
-		t.Fatal("kid drifted")
-	}
-	if _, err := aead.OpenKey(kid, ct, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := aead.OpenKey(kid, ct2, nil); err != nil {
-		t.Fatal(err)
-	}
+	return out
 }
 
 func TestRefuseJSONAndKeeper(t *testing.T) {
-	ks, err := keyset.New("a", keyset.AES256GCM, keyset.DefaultPolicy())
+	ks, err := keyset.New(t.Context(), "a", "aes", testType(keyset.DefaultPolicy()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +316,11 @@ func TestRefuseJSONAndKeeper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(pub, []byte(`"name":"a"`)) {
+	if !bytes.Contains(pub, []byte(`"name":"a"`)) || !bytes.Contains(pub, []byte(`"type":"aes"`)) {
 		t.Fatalf("%s", pub)
+	}
+	if !bytes.Contains(pub, []byte(`"primary":"168h0m0s"`)) || !bytes.Contains(pub, []byte(`"propagate":"1h0m0s"`)) {
+		t.Fatalf("policy durations not encoded as units: %s", pub)
 	}
 
 	keeper := testKeeper(t)
@@ -223,8 +335,11 @@ func TestRefuseJSONAndKeeper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Name() != "a" {
-		t.Fatal(got.Name())
+	if got.Name() != "a" || got.Type() != "aes" {
+		t.Fatalf("got name=%q type=%q", got.Name(), got.Type())
+	}
+	if _, ok := got.Key(ks.PrimaryID()); !ok {
+		t.Fatal("unmarshaled keyset missing primary material")
 	}
 
 	clear, err := ks.Marshal(insecurecleartext.Keeper)
@@ -234,6 +349,9 @@ func TestRefuseJSONAndKeeper(t *testing.T) {
 	if !bytes.Contains(clear, []byte(`"name":"a"`)) {
 		t.Fatalf("%s", clear)
 	}
+	if !bytes.Contains(clear, []byte(`"primary":"168h0m0s"`)) {
+		t.Fatalf("envelope policy durations not encoded as units: %s", clear)
+	}
 	withUnknownField := bytes.Replace(clear, []byte(`{"version":1`), []byte(`{"unknown":true,"version":1`), 1)
 	if _, err := keyset.Unmarshal("a", withUnknownField, insecurecleartext.Keeper); err == nil {
 		t.Fatal("unknown document field was accepted")
@@ -241,7 +359,7 @@ func TestRefuseJSONAndKeeper(t *testing.T) {
 }
 
 func TestInspectableAuthenticatedEnvelope(t *testing.T) {
-	ks, err := keyset.New("inspect", keyset.Ed25519, keyset.DefaultPolicy())
+	ks, err := keyset.New(t.Context(), "inspect", "jwt", testType(keyset.DefaultPolicy()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +369,7 @@ func TestInspectableAuthenticatedEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(encrypted, []byte(`"name":"inspect"`)) ||
+		!bytes.Contains(encrypted, []byte(`"type":"jwt"`)) ||
 		!bytes.Contains(encrypted, []byte(`"state":"primary"`)) ||
 		!bytes.Contains(encrypted, []byte(`"public_key"`)) {
 		t.Fatalf("public metadata is not inspectable: %s", encrypted)
@@ -260,7 +379,7 @@ func TestInspectableAuthenticatedEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if public.Name != "inspect" || len(public.Keys) != 2 || len(public.Keys[0].PublicKey) == 0 {
+	if public.Name != "inspect" || public.Type != "jwt" || len(public.Keys) != 2 || len(public.Keys[0].PublicKey) == 0 {
 		t.Fatalf("unexpected public envelope: %#v", public)
 	}
 
@@ -294,129 +413,14 @@ func TestInspectableAuthenticatedEnvelope(t *testing.T) {
 	}
 }
 
-func TestSignVerify(t *testing.T) {
-	ks, err := keyset.New("jwt", keyset.Ed25519, keyset.DefaultPolicy())
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := ks.Signer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig, err := signer.SignMsg([]byte("payload"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ver, err := ks.Verifier()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ver.VerifyKey(signer.KeyID(), []byte("payload"), sig); err != nil {
-		t.Fatal(err)
-	}
-	if err := ver.Verify([]byte("payload"), sig); err != nil {
-		t.Fatal(err)
-	}
-	publicVerifier, err := ks.Public().Verifier()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := publicVerifier.VerifyKey(signer.KeyID(), []byte("payload"), sig); err != nil {
-		t.Fatal(err)
-	}
-	var cryptoSigner crypto.Signer = signer
-	sig, err = cryptoSigner.Sign(rand.Reader, []byte("crypto.Signer message"), crypto.Hash(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := publicVerifier.VerifyKey(signer.KeyID(), []byte("crypto.Signer message"), sig); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestRS256SignVerify(t *testing.T) {
-	algorithms := []keyset.Algorithm{
-		keyset.RSAPKCS1v15_2048_SHA256,
-		keyset.RSAPKCS1v15_3072_SHA256,
-	}
-	for _, algorithm := range algorithms {
-		t.Run(string(algorithm), func(t *testing.T) {
-			ks, err := keyset.New("jwt", algorithm, keyset.DefaultPolicy())
-			if err != nil {
-				t.Fatal(err)
-			}
-			signer, err := ks.Signer()
-			if err != nil {
-				t.Fatal(err)
-			}
-			signature, err := signer.SignMsg([]byte("header.payload"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			verifier, err := ks.Public().Verifier()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := verifier.VerifyKey(signer.KeyID(), []byte("header.payload"), signature); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := signer.Sign(rand.Reader, make([]byte, 32), &rsa.PSSOptions{Hash: crypto.SHA256}); err == nil {
-				t.Fatal("RS256 signer accepted PSS options")
-			}
-		})
-	}
-}
-
-func TestMAC(t *testing.T) {
-	ks, err := keyset.New("hooks", keyset.HMACSHA256, keyset.DefaultPolicy())
-	if err != nil {
-		t.Fatal(err)
-	}
-	mac, err := ks.MAC()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tag, err := mac.Sum([]byte("body"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := mac.VerifyKey(mac.KeyID(), tag, []byte("body")); err != nil {
-		t.Fatal(err)
-	}
-	if err := mac.Verify(tag, []byte("body")); err != nil {
-		t.Fatal(err)
-	}
-	if len(tag) != mac.Overhead() || len(tag) != 37 {
-		t.Fatalf("framed MAC size=%d", len(tag))
-	}
-	if got := binary.BigEndian.Uint32(tag[1:5]); got != mac.KeyID() {
-		t.Fatalf("framed key id=%d, want %d", got, mac.KeyID())
-	}
-	tampered := append([]byte(nil), tag...)
-	tampered[4] ^= 1
-	if err := mac.Verify(tampered, []byte("body")); err == nil {
-		t.Fatal("tampered key ID was accepted")
-	}
-	raw, err := mac.ComputeRaw([]byte("body"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(raw) != mac.RawOverhead() || len(raw) != 32 {
-		t.Fatalf("raw MAC size=%d", len(raw))
-	}
-	if err := mac.VerifyKeyRaw(mac.KeyID(), raw, []byte("body")); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestClientRotator(t *testing.T) {
 	store := memstore.New(testKeeper(t))
 	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	rot, err := keyset.NewRotator(store,
+	typ := testType(keyset.DefaultPolicy())
+	reg := newRegistry(t, map[string]keyset.Type{"sessions": typ})
+	rot, err := keyset.NewRotator(store, reg,
 		keyset.WithClock(func() time.Time { return now }),
-		keyset.WithEnsure(map[string]keyset.Spec{
-			"sessions": {Algorithm: keyset.AES256GCM, Policy: keyset.DefaultPolicy()},
-		}),
+		keyset.WithEnsure(map[string]string{"sessions": "sessions"}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -429,20 +433,13 @@ func TestClientRotator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead, err := client.AEAD(t.Context(), "sessions")
+	ks, err := client.Get(t.Context(), "sessions")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ct, err := aead.Seal([]byte("x"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pt, err := aead.OpenKey(aead.KeyID(), ct, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(pt) != "x" {
-		t.Fatal(string(pt))
+	primary, ok := ks.Primary()
+	if !ok || len(primary.Private) == 0 {
+		t.Fatalf("primary=%#v", primary)
 	}
 }
 
@@ -467,8 +464,58 @@ func (s *observedStore) Public(context.Context, string) (keyset.Public, error) {
 	return s.public, nil
 }
 
-func TestClientVerifierLoadsOnlyPublicMaterial(t *testing.T) {
-	ks, err := keyset.New("jwt", keyset.Ed25519, keyset.DefaultPolicy())
+func TestClientGetReturnsIndependentCopies(t *testing.T) {
+	store := memstore.New(testKeeper(t))
+	typ := testType(keyset.Policy{Primary: time.Second})
+	ks, err := keyset.New(t.Context(), "s", "s", typ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(t.Context(), "s", ks, nil); err != nil {
+		t.Fatal(err)
+	}
+	client, err := keyset.NewClient(store, keyset.WithTTL(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := client.Get(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := client.Get(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("client returned the same *Keyset to two callers")
+	}
+
+	// Mutating one copy concurrently with reads of another must not race
+	// (run with -race) or leak into the cache.
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if _, err := a.Rotate(t.Context(), time.Now().Add(time.Hour), &typ); err != nil {
+			t.Error(err)
+		}
+	})
+	wg.Go(func() {
+		for range 100 {
+			_, _ = b.Primary()
+		}
+	})
+	wg.Wait()
+
+	c, err := client.Get(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PrimaryID() != ks.PrimaryID() || a.PrimaryID() == ks.PrimaryID() {
+		t.Fatalf("cache primary=%q rotated copy=%q original=%q", c.PrimaryID(), a.PrimaryID(), ks.PrimaryID())
+	}
+}
+
+func TestClientPublicLoadsOnlyPublicMaterial(t *testing.T) {
+	ks, err := keyset.New(t.Context(), "jwt", "jwt", testType(keyset.DefaultPolicy()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +524,7 @@ func TestClientVerifierLoadsOnlyPublicMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Verifier(t.Context(), "jwt"); err != nil {
+	if _, err := client.Public(t.Context(), "jwt"); err != nil {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
@@ -502,25 +549,97 @@ func TestClientOptions(t *testing.T) {
 
 func TestEnsureIsIdempotent(t *testing.T) {
 	store := memstore.New(testKeeper(t))
-	rotator, err := keyset.NewRotator(store)
+	reg := newRegistry(t, map[string]keyset.Type{
+		"jwt": testType(keyset.DefaultPolicy()),
+		"ec":  testType(keyset.DefaultPolicy()),
+	})
+	rotator, err := keyset.NewRotator(store, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := keyset.DefaultPolicy()
-	if err := rotator.Ensure(t.Context(), "jwt", keyset.Ed25519, policy); err != nil {
+	if err := rotator.Ensure(t.Context(), "jwt", "jwt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := rotator.Ensure(t.Context(), "jwt", keyset.Ed25519, policy); err != nil {
+	if err := rotator.Ensure(t.Context(), "jwt", "jwt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := rotator.Ensure(t.Context(), "jwt", keyset.ECDSAP256SHA256, policy); !errors.Is(err, keyset.ErrExist) {
+	if err := rotator.Ensure(t.Context(), "jwt", "ec"); !errors.Is(err, keyset.ErrExist) {
 		t.Fatalf("mismatched ensure error=%v", err)
+	}
+}
+
+func TestRotatorSharedTypeAndUnknown(t *testing.T) {
+	store := memstore.New(testKeeper(t))
+	shared := testType(keyset.DefaultPolicy())
+	reg := newRegistry(t, map[string]keyset.Type{"jwt": shared})
+	rotator, err := keyset.NewRotator(store, reg,
+		keyset.WithEnsure(map[string]string{
+			"a": "jwt",
+			"b": "jwt",
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotator.Once(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b"} {
+		ks, err := store.Get(t.Context(), name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ks.Type() != "jwt" {
+			t.Fatalf("%s type=%s", name, ks.Type())
+		}
+	}
+
+	orphan, err := keyset.New(t.Context(), "orphan", "other", testType(keyset.DefaultPolicy()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(t.Context(), "orphan", orphan, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := rotator.Once(t.Context()); !errors.Is(err, keyset.ErrInvalid) {
+		t.Fatalf("unknown type error=%v", err)
+	}
+}
+
+func TestRotatorPolicyResync(t *testing.T) {
+	store := memstore.New(testKeeper(t))
+	old := testType(keyset.Policy{Primary: time.Hour, Propagate: time.Minute})
+	ks, err := keyset.New(t.Context(), "s", "s", old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(t.Context(), "s", ks, nil); err != nil {
+		t.Fatal(err)
+	}
+	updated := keyset.DefaultPolicy()
+	reg := newRegistry(t, map[string]keyset.Type{
+		"s": {Policy: updated, New: old.New},
+	})
+	rotator, err := keyset.NewRotator(store, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotator.Once(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Get(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Policy() != updated {
+		t.Fatalf("policy=%#v", loaded.Policy())
 	}
 }
 
 func TestConcurrentRotatorStop(t *testing.T) {
 	store := memstore.New(testKeeper(t))
-	rotator, err := keyset.NewRotator(store, keyset.WithInterval(time.Hour))
+	reg := newRegistry(t, map[string]keyset.Type{})
+	rotator, err := keyset.NewRotator(store, reg, keyset.WithInterval(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,4 +655,16 @@ func TestConcurrentRotatorStop(t *testing.T) {
 		}()
 	}
 	stopped.Wait()
+}
+
+func TestRegistryValidation(t *testing.T) {
+	if _, err := keyset.NewRegistry(map[string]keyset.Type{"": testType(keyset.DefaultPolicy())}); err == nil {
+		t.Fatal("empty type name accepted")
+	}
+	if _, err := keyset.NewRegistry(map[string]keyset.Type{"x": {Policy: keyset.DefaultPolicy()}}); err == nil {
+		t.Fatal("nil New accepted")
+	}
+	if _, err := keyset.NewRotator(memstore.New(testKeeper(t)), nil); err == nil {
+		t.Fatal("nil registry accepted")
+	}
 }

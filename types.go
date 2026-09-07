@@ -1,35 +1,14 @@
 package keyset
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
 
-const documentVersion = 1
+const envelopeVersion = 1
 
-// Algorithm is an allowlisted primitive. A keyset is frozen to one algorithm.
-type Algorithm string
-
-const (
-	AES256GCM  Algorithm = "aes256-gcm"
-	HMACSHA256 Algorithm = "hmac-sha256"
-
-	Ed25519                 Algorithm = "ed25519"
-	ECDSAP256SHA256         Algorithm = "ecdsa-p256-sha256"
-	ECDSAP384SHA384         Algorithm = "ecdsa-p384-sha384"
-	RSAPKCS1v15_2048_SHA256 Algorithm = "rsa-pkcs1v15-2048-sha256"
-	RSAPKCS1v15_3072_SHA256 Algorithm = "rsa-pkcs1v15-3072-sha256"
-	RSAPSS2048SHA256        Algorithm = "rsa-pss-2048-sha256"
-	RSAPSS3072SHA256        Algorithm = "rsa-pss-3072-sha256"
-)
-
-type purpose string
-
-const (
-	purposeAEAD purpose = "aead"
-	purposeMAC  purpose = "mac"
-	purposeSign purpose = "sign"
-)
+const maxKeyIDLen = 128
 
 // Policy controls automated rotation.
 type Policy struct {
@@ -72,50 +51,81 @@ func (p Policy) validate() error {
 	return nil
 }
 
-func (a Algorithm) purpose() (purpose, error) {
-	switch a {
-	case AES256GCM:
-		return purposeAEAD, nil
-	case HMACSHA256:
-		return purposeMAC, nil
-	case Ed25519, ECDSAP256SHA256, ECDSAP384SHA384,
-		RSAPKCS1v15_2048_SHA256, RSAPKCS1v15_3072_SHA256,
-		RSAPSS2048SHA256, RSAPSS3072SHA256:
-		return purposeSign, nil
-	default:
-		return "", fmt.Errorf("%w: unknown algorithm %q", ErrInvalid, a)
-	}
-}
-
-type keyState string
+// KeyState is a key's lifecycle state.
+type KeyState string
 
 const (
-	statePending    keyState = "pending"
-	statePrimary    keyState = "primary"
-	statePhasingOut keyState = "phasing_out"
-	stateDisabled   keyState = "disabled"
+	StatePending    KeyState = "pending"
+	StatePrimary    KeyState = "primary"
+	StatePhasingOut KeyState = "phasing_out"
+	StateDisabled   KeyState = "disabled"
 )
 
-func (s keyState) canEncryptOrSign() bool { return s == statePrimary }
-func (s keyState) canDecryptOrVerify() bool {
-	return s == statePrimary || s == statePending || s == statePhasingOut
+// IsPrimary reports whether the key is the current primary (sign/encrypt).
+func (s KeyState) IsPrimary() bool { return s == StatePrimary }
+
+// IsUsable reports whether the key may be used to verify or decrypt.
+// Pending, primary, and phasing-out keys are usable; disabled keys are not.
+func (s KeyState) IsUsable() bool {
+	return s == StatePrimary || s == StatePending || s == StatePhasingOut
+}
+
+// Material is opaque key bytes returned by a Type constructor.
+type Material struct {
+	// ID is an opaque key id, up to 128 bytes. Set it when the id derives from
+	// the key itself (e.g. a JWK thumbprint). Empty defers to Type.NewID.
+	ID string
+	// Private is required secret material. Encoding is the type's contract.
+	Private []byte
+	// Public is optional public material. Encoding is the type's contract.
+	Public []byte
+}
+
+// Type describes how to mint keys and how they rotate.
+type Type struct {
+	Policy Policy
+	New    func(ctx context.Context) (Material, error)
+	// NewID optionally assigns an id when New returns Material with an empty
+	// ID. existing holds every id currently in the keyset, in keyset order,
+	// so generators can count up or retry on collision. The result must be
+	// non-empty, at most 128 bytes, and not in existing. Nil assigns a random
+	// version 4 UUID.
+	NewID func(existing []string) (string, error)
+}
+
+func (t Type) validate() error {
+	if t.New == nil {
+		return fmt.Errorf("%w: New is required", ErrInvalid)
+	}
+	return t.Policy.validate()
+}
+
+// Key is a copied view of one key, including secret material.
+type Key struct {
+	ID          string
+	State       KeyState
+	CreatedAt   time.Time
+	PromotedAt  *time.Time
+	PhasedOutAt *time.Time
+	DisabledAt  *time.Time
+	DeleteAfter *time.Time
+	Private     []byte
+	Public      []byte
 }
 
 // Public is a secret-free view of a keyset (safe to JSON-encode).
+// UnmarshalPublic does not authenticate this metadata.
 type Public struct {
 	Name      string      `json:"name"`
-	Algorithm Algorithm   `json:"algorithm"`
-	PrimaryID uint32      `json:"primary_id"`
+	Type      string      `json:"type"`
+	Policy    Policy      `json:"policy"`
+	PrimaryID string      `json:"primary_id"`
 	Keys      []PublicKey `json:"keys"`
 }
 
-// PublicKeyset is the preferred name for Public. Public remains as a compact
-// compatibility name for persisted store interfaces.
-type PublicKeyset = Public
-
 // PublicKey is one public key in a Public view.
 type PublicKey struct {
-	ID        uint32 `json:"id"`
-	State     string `json:"state"`
-	PublicKey []byte `json:"public_key,omitempty"`
+	ID        string   `json:"id"`
+	State     KeyState `json:"state"`
+	PublicKey []byte   `json:"public_key,omitempty"`
 }

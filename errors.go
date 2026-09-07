@@ -7,7 +7,5 @@ var (
 	ErrExist                = errors.New("keyset: already exists")
 	ErrConflict             = errors.New("keyset: concurrent modification")
 	ErrInvalid              = errors.New("keyset: invalid")
-	ErrUnknownKey           = errors.New("keyset: unknown key id")
-	ErrVerificationFailed   = errors.New("keyset: verification failed")
 	ErrAuthenticationFailed = errors.New("keyset: authentication failed")
 )

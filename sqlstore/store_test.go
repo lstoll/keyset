@@ -30,7 +30,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := keyset.New("a", keyset.Ed25519, keyset.DefaultPolicy())
+	first, err := newTestKeyset(t, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if loaded.PrimaryID() != first.PrimaryID() || revision != int64(1) {
-		t.Fatalf("loaded primary=%d revision=%v", loaded.PrimaryID(), revision)
+		t.Fatalf("loaded primary=%s revision=%v", loaded.PrimaryID(), revision)
 	}
 	if err := store.Write(t.Context(), "a", loaded, revision); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatalf("stale update error=%v", err)
 	}
 
-	second, err := keyset.New("b", keyset.AES256GCM, keyset.DefaultPolicy())
+	second, err := newTestKeyset(t, "b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestPublicDoesNotOpenPrivateMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := keyset.New("jwt", keyset.Ed25519, keyset.DefaultPolicy())
+	value, err := newTestKeyset(t, "jwt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +155,16 @@ func TestDialectAndOptions(t *testing.T) {
 	if !strings.Contains(mysql.Schema(), "`keysets`") || !strings.Contains(mysql.Schema(), "LONGBLOB") {
 		t.Fatalf("MySQL schema=%s", mysql.Schema())
 	}
+}
+
+func newTestKeyset(t *testing.T, name string) (*keyset.Keyset, error) {
+	t.Helper()
+	return keyset.New(t.Context(), name, "test", keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New: func(context.Context) (keyset.Material, error) {
+			return keyset.Material{Private: []byte("secret"), Public: []byte("pub")}, nil
+		},
+	})
 }
 
 type observedKeeper struct {

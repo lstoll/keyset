@@ -9,18 +9,13 @@ import (
 	"time"
 )
 
-// Spec describes a keyset that Rotator.Ensure should create if missing.
-type Spec struct {
-	Algorithm Algorithm
-	Policy    Policy
-}
-
-// Rotator rotates keysets in an AdminStore.
+// Rotator rotates keysets in an AdminStore using a type registry.
 type Rotator struct {
 	store    AdminStore
+	registry *Registry
 	interval time.Duration
 	now      func() time.Time
-	ensure   map[string]Spec
+	ensure   map[string]string
 	logger   *slog.Logger
 
 	mu      sync.Mutex
@@ -43,17 +38,18 @@ func WithInterval(d time.Duration) RotatorOption {
 	}
 }
 
-// WithEnsure provisions named keysets when missing.
-func WithEnsure(specs map[string]Spec) RotatorOption {
+// WithEnsure provisions named keysets when missing. Values are type names.
+// Ensure is create-only; names that leave the map are not deleted.
+func WithEnsure(names map[string]string) RotatorOption {
 	return func(r *Rotator) error {
-		for name, spec := range specs {
-			if _, err := spec.Algorithm.purpose(); err != nil {
-				return fmt.Errorf("keyset: ensure %q: %w", name, err)
+		for name, typ := range names {
+			if name == "" {
+				return fmt.Errorf("%w: ensure name is required", ErrInvalid)
 			}
-			if err := spec.Policy.validate(); err != nil {
-				return fmt.Errorf("keyset: ensure %q: %w", name, err)
+			if _, ok := r.registry.Lookup(typ); !ok {
+				return fmt.Errorf("%w: ensure %q: unknown type %q", ErrInvalid, name, typ)
 			}
-			r.ensure[name] = spec
+			r.ensure[name] = typ
 		}
 		return nil
 	}
@@ -80,15 +76,19 @@ func WithClock(now func() time.Time) RotatorOption {
 }
 
 // NewRotator constructs a Rotator.
-func NewRotator(store AdminStore, opts ...RotatorOption) (*Rotator, error) {
+func NewRotator(store AdminStore, registry *Registry, opts ...RotatorOption) (*Rotator, error) {
 	if store == nil {
 		return nil, errors.New("keyset: store is required")
 	}
+	if registry == nil {
+		return nil, errors.New("keyset: registry is required")
+	}
 	r := &Rotator{
-		store:  store,
-		now:    time.Now,
-		ensure: make(map[string]Spec),
-		logger: slog.Default().With("component", "keyset.rotator"),
+		store:    store,
+		registry: registry,
+		now:      time.Now,
+		ensure:   make(map[string]string),
+		logger:   slog.Default().With("component", "keyset.rotator"),
 	}
 	for _, opt := range opts {
 		if err := opt(r); err != nil {
@@ -121,7 +121,7 @@ func (r *Rotator) Once(ctx context.Context) error {
 		first = err
 	}
 
-	for name, spec := range r.ensure {
+	for name, typ := range r.ensure {
 		if _, ok := seen[name]; ok {
 			continue
 		}
@@ -130,12 +130,13 @@ func (r *Rotator) Once(ctx context.Context) error {
 			continue
 		}
 		if !errors.Is(err, ErrNotFound) {
+			r.logger.Error("ensure read failed", "name", name, "error", err)
 			if first == nil {
 				first = err
 			}
 			continue
 		}
-		if err := r.Ensure(ctx, name, spec.Algorithm, spec.Policy); err != nil {
+		if err := r.Ensure(ctx, name, typ); err != nil {
 			r.logger.Error("ensure failed", "name", name, "error", err)
 			if first == nil {
 				first = err
@@ -154,7 +155,11 @@ func (r *Rotator) process(ctx context.Context, name string) error {
 		}
 		return err
 	}
-	changed, err := ks.Rotate(r.now())
+	t, ok := r.registry.Lookup(ks.Type())
+	if !ok {
+		return fmt.Errorf("%w: unknown type %q", ErrInvalid, ks.Type())
+	}
+	changed, err := ks.Rotate(ctx, r.now(), &t)
 	if err != nil {
 		return err
 	}
@@ -173,43 +178,41 @@ func (r *Rotator) process(ctx context.Context, name string) error {
 }
 
 // Ensure creates name if it does not exist.
-func (r *Rotator) Ensure(ctx context.Context, name string, alg Algorithm, policy Policy) error {
+func (r *Rotator) Ensure(ctx context.Context, name, typ string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if name == "" {
 		return fmt.Errorf("%w: name is required", ErrInvalid)
 	}
-	if _, err := alg.purpose(); err != nil {
-		return err
-	}
-	if err := policy.validate(); err != nil {
-		return err
+	t, ok := r.registry.Lookup(typ)
+	if !ok {
+		return fmt.Errorf("%w: unknown type %q", ErrInvalid, typ)
 	}
 	ks, _, err := r.store.Read(ctx, name)
 	if err == nil {
-		if ks.Algorithm() != alg || ks.Policy() != policy {
-			return fmt.Errorf("%w: existing keyset %q does not match requested specification", ErrExist, name)
+		if ks.Type() != typ {
+			return fmt.Errorf("%w: existing keyset %q does not match requested type", ErrExist, name)
 		}
 		return nil
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	ks, err = newAt(name, alg, policy, r.now())
+	ks, err = newAt(ctx, name, typ, t, r.now())
 	if err != nil {
 		return err
 	}
 	if err := r.store.Write(ctx, name, ks, nil); err != nil {
 		if errors.Is(err, ErrConflict) {
 			existing, _, readErr := r.store.Read(ctx, name)
-			if readErr == nil && existing.Algorithm() == alg && existing.Policy() == policy {
+			if readErr == nil && existing.Type() == typ {
 				return nil
 			}
 		}
 		return err
 	}
-	r.logger.Info("ensured", "name", name, "algorithm", alg)
+	r.logger.Info("ensured", "name", name, "type", typ)
 	return nil
 }
 

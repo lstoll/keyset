@@ -1,14 +1,17 @@
 module lds.li/keyset/k8sstore
 
-go 1.26.0
+go 1.27.0
 
+// Local development and CI build against the parent directory. Consumers
+// ignore replace directives, so the require below must name a tagged release
+// of lds.li/keyset that contains the API this module uses.
 replace lds.li/keyset => ../
 
 require (
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3
-	lds.li/keyset v0.0.0
+	lds.li/keyset v0.1.0
 )
 
 require (

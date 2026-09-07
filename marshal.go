@@ -1,12 +1,11 @@
 package keyset
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 )
 
@@ -17,24 +16,71 @@ const (
 
 var errRefuseJSON = errors.New("keyset: refuse JSON encode/decode of secrets; use Marshal/Unmarshal with a Keeper")
 
+var jsonStrict = json.RejectUnknownMembers(true)
+
+type policyJSON struct {
+	Primary   string `json:"primary"`
+	Propagate string `json:"propagate"`
+	PhaseOut  string `json:"phase_out"`
+	Retention string `json:"retention"`
+}
+
+// MarshalJSON encodes durations as time.Duration strings (e.g. "168h0m0s").
+func (p Policy) MarshalJSON() ([]byte, error) {
+	return json.Marshal(policyJSON{
+		Primary:   p.Primary.String(),
+		Propagate: p.Propagate.String(),
+		PhaseOut:  p.PhaseOut.String(),
+		Retention: p.Retention.String(),
+	})
+}
+
+// UnmarshalJSON parses durations with time.ParseDuration.
+func (p *Policy) UnmarshalJSON(data []byte) error {
+	var raw policyJSON
+	if err := json.Unmarshal(data, &raw, jsonStrict); err != nil {
+		return err
+	}
+	primary, err := time.ParseDuration(raw.Primary)
+	if err != nil {
+		return fmt.Errorf("%w: policy.primary: %v", ErrInvalid, err)
+	}
+	propagate, err := time.ParseDuration(raw.Propagate)
+	if err != nil {
+		return fmt.Errorf("%w: policy.propagate: %v", ErrInvalid, err)
+	}
+	phaseOut, err := time.ParseDuration(raw.PhaseOut)
+	if err != nil {
+		return fmt.Errorf("%w: policy.phase_out: %v", ErrInvalid, err)
+	}
+	retention, err := time.ParseDuration(raw.Retention)
+	if err != nil {
+		return fmt.Errorf("%w: policy.retention: %v", ErrInvalid, err)
+	}
+	p.Primary = primary
+	p.Propagate = propagate
+	p.PhaseOut = phaseOut
+	p.Retention = retention
+	return nil
+}
+
 type envelope struct {
-	Version         int             `json:"version"`
-	Metadata        json.RawMessage `json:"metadata"`
-	PrivateMaterial []byte          `json:"private_material"`
+	Version         int            `json:"version"`
+	Metadata        jsontext.Value `json:"metadata"`
+	PrivateMaterial []byte         `json:"private_material"`
 }
 
 type metadataDocument struct {
 	Name      string        `json:"name"`
-	Purpose   purpose       `json:"purpose"`
-	Algorithm Algorithm     `json:"algorithm"`
+	Type      string        `json:"type"`
 	Policy    Policy        `json:"policy"`
-	PrimaryID uint32        `json:"primary_id"`
+	PrimaryID string        `json:"primary_id"`
 	Keys      []metadataKey `json:"keys"`
 }
 
 type metadataKey struct {
-	ID          uint32     `json:"id"`
-	State       keyState   `json:"state"`
+	ID          string     `json:"id"`
+	State       KeyState   `json:"state"`
 	CreatedAt   time.Time  `json:"created_at"`
 	PromotedAt  *time.Time `json:"promoted_at,omitempty"`
 	PhasedOutAt *time.Time `json:"phased_out_at,omitempty"`
@@ -44,12 +90,11 @@ type metadataKey struct {
 }
 
 type privateDocument struct {
-	Version int                  `json:"version"`
-	Keys    []privateKeyMaterial `json:"keys"`
+	Keys []privateKeyMaterial `json:"keys"`
 }
 
 type privateKeyMaterial struct {
-	ID         uint32 `json:"id"`
+	ID         string `json:"id"`
 	PrivateKey []byte `json:"private_key"`
 }
 
@@ -58,6 +103,12 @@ func (k Keyset) MarshalJSON() ([]byte, error) { return nil, errRefuseJSON }
 
 // UnmarshalJSON always fails.
 func (k *Keyset) UnmarshalJSON([]byte) error { return errRefuseJSON }
+
+// MarshalJSONTo always fails.
+func (k Keyset) MarshalJSONTo(*jsontext.Encoder) error { return errRefuseJSON }
+
+// UnmarshalJSONFrom always fails.
+func (k *Keyset) UnmarshalJSONFrom(*jsontext.Decoder) error { return errRefuseJSON }
 
 // Marshal returns an inspectable envelope containing clear public metadata and
 // sealed private material. The exact metadata bytes are authenticated as AAD.
@@ -90,8 +141,8 @@ func (k *Keyset) Marshal(keeper Keeper) ([]byte, error) {
 		return nil, err
 	}
 	encoded, err := json.Marshal(envelope{
-		Version:         documentVersion,
-		Metadata:        metadataJSON,
+		Version:         envelopeVersion,
+		Metadata:        jsontext.Value(metadataJSON),
 		PrivateMaterial: sealed,
 	})
 	if err != nil {
@@ -141,9 +192,6 @@ func Unmarshal(name string, blob []byte, keeper Keeper) (*Keyset, error) {
 	if err := decodeJSONStrict(privateJSON, &private); err != nil {
 		return nil, fmt.Errorf("%w: invalid private document: %v", ErrInvalid, err)
 	}
-	if private.Version != documentVersion {
-		return nil, fmt.Errorf("%w: unsupported private document version %d", ErrInvalid, private.Version)
-	}
 	doc, err := joinDocument(metadata, private)
 	if err != nil {
 		return nil, err
@@ -161,13 +209,12 @@ func Unmarshal(name string, blob []byte, keeper Keeper) (*Keyset, error) {
 func splitDocument(doc document) (metadataDocument, privateDocument) {
 	metadata := metadataDocument{
 		Name:      doc.Name,
-		Purpose:   doc.Purpose,
-		Algorithm: doc.Algorithm,
+		Type:      doc.Type,
 		Policy:    doc.Policy,
 		PrimaryID: doc.PrimaryID,
 		Keys:      make([]metadataKey, 0, len(doc.Keys)),
 	}
-	private := privateDocument{Version: documentVersion, Keys: make([]privateKeyMaterial, 0, len(doc.Keys))}
+	private := privateDocument{Keys: make([]privateKeyMaterial, 0, len(doc.Keys))}
 	for _, key := range doc.Keys {
 		metadata.Keys = append(metadata.Keys, metadataKey{
 			ID:          key.ID,
@@ -189,10 +236,8 @@ func splitDocument(doc document) (metadataDocument, privateDocument) {
 
 func (m metadataDocument) document() document {
 	doc := document{
-		Version:   documentVersion,
 		Name:      m.Name,
-		Purpose:   m.Purpose,
-		Algorithm: m.Algorithm,
+		Type:      m.Type,
 		Policy:    m.Policy,
 		PrimaryID: m.PrimaryID,
 		Keys:      make([]key, 0, len(m.Keys)),
@@ -214,13 +259,16 @@ func (m metadataDocument) document() document {
 
 func joinDocument(metadata metadataDocument, private privateDocument) (document, error) {
 	doc := metadata.document()
-	material := make(map[uint32][]byte, len(private.Keys))
+	material := make(map[string][]byte, len(private.Keys))
 	for _, key := range private.Keys {
-		if key.ID == 0 || len(key.PrivateKey) == 0 {
+		if err := validateKeyID(key.ID); err != nil {
+			return document{}, err
+		}
+		if len(key.PrivateKey) == 0 {
 			return document{}, fmt.Errorf("%w: invalid private key material", ErrInvalid)
 		}
 		if _, exists := material[key.ID]; exists {
-			return document{}, fmt.Errorf("%w: duplicate private key id %d", ErrInvalid, key.ID)
+			return document{}, fmt.Errorf("%w: duplicate private key id %q", ErrInvalid, key.ID)
 		}
 		material[key.ID] = key.PrivateKey
 	}
@@ -230,19 +278,19 @@ func joinDocument(metadata metadataDocument, private privateDocument) (document,
 	for i := range doc.Keys {
 		privateKey, ok := material[doc.Keys[i].ID]
 		if !ok {
-			return document{}, fmt.Errorf("%w: key %d missing private material", ErrInvalid, doc.Keys[i].ID)
+			return document{}, fmt.Errorf("%w: key %q missing private material", ErrInvalid, doc.Keys[i].ID)
 		}
 		doc.Keys[i].PrivateKey = append([]byte(nil), privateKey...)
 	}
 	return doc, nil
 }
 
-func decodeEnvelope(blob []byte) (envelope, metadataDocument, json.RawMessage, error) {
+func decodeEnvelope(blob []byte) (envelope, metadataDocument, []byte, error) {
 	env, metadata, metadataJSON, _, err := decodeEnvelopeWithMaterial(blob)
 	return env, metadata, metadataJSON, err
 }
 
-func decodeEnvelopeWithMaterial(blob []byte) (envelope, metadataDocument, json.RawMessage, []byte, error) {
+func decodeEnvelopeWithMaterial(blob []byte) (envelope, metadataDocument, []byte, []byte, error) {
 	if len(blob) > maxEnvelopeBytes {
 		return envelope{}, metadataDocument{}, nil, nil, fmt.Errorf("%w: envelope too large", ErrInvalid)
 	}
@@ -250,30 +298,21 @@ func decodeEnvelopeWithMaterial(blob []byte) (envelope, metadataDocument, json.R
 	if err := decodeJSONStrict(blob, &env); err != nil {
 		return envelope{}, metadataDocument{}, nil, nil, fmt.Errorf("%w: invalid envelope: %v", ErrInvalid, err)
 	}
-	if env.Version != documentVersion {
+	if env.Version != envelopeVersion {
 		return envelope{}, metadataDocument{}, nil, nil, fmt.Errorf("%w: unsupported envelope version %d", ErrInvalid, env.Version)
 	}
 	if len(env.Metadata) == 0 || len(env.PrivateMaterial) == 0 {
 		return envelope{}, metadataDocument{}, nil, nil, fmt.Errorf("%w: incomplete envelope", ErrInvalid)
 	}
 	var metadata metadataDocument
-	if err := decodeJSONStrict(env.Metadata, &metadata); err != nil {
+	if err := decodeJSONStrict([]byte(env.Metadata), &metadata); err != nil {
 		return envelope{}, metadataDocument{}, nil, nil, fmt.Errorf("%w: invalid metadata: %v", ErrInvalid, err)
 	}
-	return env, metadata, env.Metadata, env.PrivateMaterial, nil
+	return env, metadata, []byte(env.Metadata), env.PrivateMaterial, nil
 }
 
 func decodeJSONStrict(data []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return errors.New("trailing JSON data")
-	}
-	return nil
+	return json.Unmarshal(data, target, jsonStrict)
 }
 
 func envelopeAAD(name string, metadata []byte) []byte {
