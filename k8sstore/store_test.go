@@ -2,6 +2,7 @@ package k8sstore
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"errors"
@@ -29,7 +30,7 @@ const (
 func TestStoreLifecycle(t *testing.T) {
 	store := newTestStore(t)
 
-	first, err := keyset.New("a", keyset.Ed25519, keyset.DefaultPolicy())
+	first, err := newTestKeyset(t, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +53,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if loaded.PrimaryID() != first.PrimaryID() {
-		t.Fatalf("loaded primary=%d", loaded.PrimaryID())
+		t.Fatalf("loaded primary=%s", loaded.PrimaryID())
 	}
 	if revision == "" {
 		t.Fatal("expected non-empty resourceVersion")
@@ -64,7 +65,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatalf("stale update error=%v", err)
 	}
 
-	second, err := keyset.New("b", keyset.AES256GCM, keyset.DefaultPolicy())
+	second, err := newTestKeyset(t, "b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +95,7 @@ func TestPublicDoesNotOpenPrivateMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := keyset.New("jwt", keyset.Ed25519, keyset.DefaultPolicy())
+	value, err := newTestKeyset(t, "jwt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestConstructorValidation(t *testing.T) {
 
 func TestInvalidKeysetName(t *testing.T) {
 	store := newTestStore(t)
-	value, err := keyset.New("bad/name", keyset.Ed25519, keyset.DefaultPolicy())
+	value, err := newTestKeyset(t, "bad/name")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,11 +171,19 @@ func TestInvalidKeysetName(t *testing.T) {
 func TestRotatorOnce(t *testing.T) {
 	store := newTestStore(t)
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	rotator, err := keyset.NewRotator(store,
+	typ := keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New: func(context.Context) (keyset.Material, error) {
+			return keyset.Material{Private: []byte("secret"), Public: []byte("pub")}, nil
+		},
+	}
+	reg, err := keyset.NewRegistry(map[string]keyset.Type{"jwt": typ})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotator, err := keyset.NewRotator(store, reg,
 		keyset.WithClock(func() time.Time { return now }),
-		keyset.WithEnsure(map[string]keyset.Spec{
-			"jwt": {Algorithm: keyset.Ed25519, Policy: keyset.DefaultPolicy()},
-		}),
+		keyset.WithEnsure(map[string]string{"jwt": "jwt"}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +211,7 @@ func TestRotatorOnce(t *testing.T) {
 
 func TestWriteInvalidRevision(t *testing.T) {
 	store := newTestStore(t)
-	value, err := keyset.New("a", keyset.Ed25519, keyset.DefaultPolicy())
+	value, err := newTestKeyset(t, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +232,7 @@ func TestUpdateAPIConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := keyset.New("a", keyset.Ed25519, keyset.DefaultPolicy())
+	value, err := newTestKeyset(t, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +267,16 @@ func (k *observedKeeper) Open(ciphertext, aad []byte) ([]byte, error) {
 		return nil, errors.New("Open rejected by test")
 	}
 	return k.keeper.Open(ciphertext, aad)
+}
+
+func newTestKeyset(t *testing.T, name string) (*keyset.Keyset, error) {
+	t.Helper()
+	return keyset.New(t.Context(), name, "test", keyset.Type{
+		Policy: keyset.DefaultPolicy(),
+		New: func(context.Context) (keyset.Material, error) {
+			return keyset.Material{Private: []byte("secret"), Public: []byte("pub")}, nil
+		},
+	})
 }
 
 func newTestStore(t *testing.T) *Store {

@@ -7,9 +7,8 @@ import (
 	"time"
 )
 
-// Client caches keysets from a Store and returns snapshot-bound primitives.
-// Primitive requests reload an expired cache entry, but a previously returned
-// primitive never refreshes itself.
+// Client caches keysets from a Store. Get and Public reload an expired cache
+// entry, but a previously returned Keyset or Public value never refreshes itself.
 type Client struct {
 	store Store
 	ttl   time.Duration
@@ -66,7 +65,7 @@ func (c *Client) get(ctx context.Context, name string) (*Keyset, error) {
 	c.mu.Lock()
 	if e, ok := c.cache[name]; ok && c.ttl > 0 && time.Since(e.when) < c.ttl {
 		c.mu.Unlock()
-		return e.ks, nil
+		return e.ks.clone(), nil
 	}
 	c.mu.Unlock()
 	if ctx == nil {
@@ -76,8 +75,11 @@ func (c *Client) get(ctx context.Context, name string) (*Keyset, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keyset: load %q: %w", name, err)
 	}
+	if ks == nil {
+		return nil, fmt.Errorf("%w: store returned nil keyset for %q", ErrInvalid, name)
+	}
 	c.mu.Lock()
-	c.cache[name] = &cacheEntry{ks: ks, when: time.Now()}
+	c.cache[name] = &cacheEntry{ks: ks.clone(), when: time.Now()}
 	c.mu.Unlock()
 	return ks, nil
 }
@@ -112,48 +114,14 @@ func clonePublic(in Public) Public {
 	return out
 }
 
-// AEAD loads name subject to the configured TTL and returns a new snapshot AEAD.
-func (c *Client) AEAD(ctx context.Context, name string) (*AEAD, error) {
-	ks, err := c.get(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return ks.AEAD()
-}
-
-// MAC loads name subject to the configured TTL and returns a new snapshot MAC.
-func (c *Client) MAC(ctx context.Context, name string) (*MAC, error) {
-	ks, err := c.get(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return ks.MAC()
-}
-
-// Signer loads name subject to the configured TTL and returns a new snapshot signer.
-func (c *Client) Signer(ctx context.Context, name string) (*Signer, error) {
-	ks, err := c.get(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return ks.Signer()
-}
-
-// Verifier loads public metadata subject to the configured TTL and returns a
-// new snapshot verifier.
-func (c *Client) Verifier(ctx context.Context, name string) (*Verifier, error) {
-	public, err := c.getPublic(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return public.Verifier()
+// Get loads name subject to the configured TTL and returns a snapshot keyset.
+// Each call returns a separate copy, so callers may mutate it (e.g. Rotate)
+// without affecting other callers or the cache.
+func (c *Client) Get(ctx context.Context, name string) (*Keyset, error) {
+	return c.get(ctx, name)
 }
 
 // Public returns the public view for name.
 func (c *Client) Public(ctx context.Context, name string) (Public, error) {
-	public, err := c.getPublic(ctx, name)
-	if err != nil {
-		return Public{}, err
-	}
-	return public, nil
+	return c.getPublic(ctx, name)
 }

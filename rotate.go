@@ -1,19 +1,28 @@
 package keyset
 
 import (
+	"context"
 	"fmt"
-	"log/slog"
 	"sort"
 	"time"
 )
 
 // Rotate advances key lifecycle for this keyset. If now is zero, time.Now is used.
-func (k *Keyset) Rotate(now time.Time) (changed bool, err error) {
+//
+// t supplies the constructor, id generator, and policy. A non-nil t replaces
+// the keyset's policy with t.Policy (reported as a change if it differs) and is
+// kept for later calls. If t is nil, the Type given to New is used along with
+// the stored policy; keysets from Unmarshal have no Type, so minting a pending
+// key returns ErrInvalid. Rotate is atomic: on error the keyset is unchanged.
+func (k *Keyset) Rotate(ctx context.Context, now time.Time, t *Type) (changed bool, err error) {
 	if k == nil {
 		return false, fmt.Errorf("%w: nil keyset", ErrInvalid)
 	}
 	if err := k.validate(); err != nil {
 		return false, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -21,39 +30,51 @@ func (k *Keyset) Rotate(now time.Time) (changed bool, err error) {
 		now = now.UTC()
 	}
 
+	// Work on a copy so a failure part way through cannot leave k half-rotated.
+	w := k.clone()
+	policyChanged := false
+	if t != nil {
+		if err := t.validate(); err != nil {
+			return false, fmt.Errorf("keyset: type %q: %w", w.doc.Type, err)
+		}
+		tc := *t
+		w.typ = &tc
+		if w.doc.Policy != t.Policy {
+			w.doc.Policy = t.Policy
+			policyChanged = true
+		}
+	}
 	r := &rotator{
-		k:      k,
-		policy: k.doc.Policy,
+		k:      w,
+		policy: w.doc.Policy,
 		now:    now,
-		logger: slog.New(slog.DiscardHandler),
+		ctx:    ctx,
+		typ:    w.typ,
 	}
-	r.index()
-	if err := r.handleDeletions(); err != nil {
-		return r.changed, err
+	for _, step := range []func() error{
+		r.handleDeletions,
+		r.handlePhaseOut,
+		r.handlePromotions,
+		r.handleKeyGeneration,
+	} {
+		r.index()
+		if err := step(); err != nil {
+			return false, err
+		}
 	}
-	r.index()
-	if err := r.handlePhaseOut(); err != nil {
-		return r.changed, err
+	if err := w.validate(); err != nil {
+		return false, fmt.Errorf("keyset: inconsistent after rotate: %w", err)
 	}
-	r.index()
-	if err := r.handlePromotions(); err != nil {
-		return r.changed, err
-	}
-	r.index()
-	if err := r.handleKeyGeneration(); err != nil {
-		return r.changed, err
-	}
-	if err := k.validate(); err != nil {
-		return r.changed, fmt.Errorf("keyset: inconsistent after rotate: %w", err)
-	}
-	return r.changed, nil
+	*k = *w
+	return r.changed || policyChanged, nil
 }
 
 type rotator struct {
 	k       *Keyset
 	policy  Policy
 	now     time.Time
-	logger  *slog.Logger
+	ctx     context.Context
+	typ     *Type
 	changed bool
 
 	primary    *key
@@ -70,13 +91,13 @@ func (r *rotator) index() {
 	for i := range r.k.doc.Keys {
 		ky := &r.k.doc.Keys[i]
 		switch ky.State {
-		case statePrimary:
+		case StatePrimary:
 			r.primary = ky
-		case statePending:
+		case StatePending:
 			r.pending = append(r.pending, ky)
-		case statePhasingOut:
+		case StatePhasingOut:
 			r.phasingOut = append(r.phasingOut, ky)
-		case stateDisabled:
+		case StateDisabled:
 			r.disabled = append(r.disabled, ky)
 		}
 	}
@@ -89,7 +110,7 @@ func (r *rotator) handleDeletions() error {
 	keep := r.k.doc.Keys[:0]
 	for i := range r.k.doc.Keys {
 		ky := r.k.doc.Keys[i]
-		if ky.State == stateDisabled && ky.DeleteAfter != nil && !r.now.Before(ky.DeleteAfter.UTC()) {
+		if ky.State == StateDisabled && ky.DeleteAfter != nil && !r.now.Before(ky.DeleteAfter.UTC()) {
 			r.changed = true
 			continue
 		}
@@ -108,7 +129,7 @@ func (r *rotator) handlePhaseOut() error {
 			continue
 		}
 		now := r.now
-		ky.State = stateDisabled
+		ky.State = StateDisabled
 		ky.DisabledAt = &now
 		if r.policy.Retention > 0 {
 			del := r.now.Add(r.policy.Retention)
@@ -138,10 +159,10 @@ func (r *rotator) handlePromotions() error {
 			if r.now.Before(propEnd) {
 				continue
 			}
-			r.primary.State = statePhasingOut
+			r.primary.State = StatePhasingOut
 			now := r.now
 			r.primary.PhasedOutAt = &now
-			pending.State = statePrimary
+			pending.State = StatePrimary
 			pending.PromotedAt = &now
 			r.k.doc.PrimaryID = pending.ID
 			r.changed = true
@@ -158,7 +179,7 @@ func (r *rotator) handlePromotions() error {
 	if r.now.Before(propEnd) {
 		return nil
 	}
-	pending.State = statePrimary
+	pending.State = StatePrimary
 	now := r.now
 	pending.PromotedAt = &now
 	r.k.doc.PrimaryID = pending.ID
@@ -171,14 +192,14 @@ func (r *rotator) handleKeyGeneration() error {
 	hasPrimary := false
 	for i := range r.k.doc.Keys {
 		switch r.k.doc.Keys[i].State {
-		case statePending:
+		case StatePending:
 			hasPending = true
-		case statePrimary:
+		case StatePrimary:
 			hasPrimary = true
 		}
 	}
 	if hasPrimary && !hasPending {
-		if _, err := r.k.addKey(statePending, r.now); err != nil {
+		if _, err := r.k.addKey(r.ctx, StatePending, r.now, r.typ); err != nil {
 			return fmt.Errorf("keyset: generate pending: %w", err)
 		}
 		r.changed = true

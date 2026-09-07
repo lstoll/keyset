@@ -1,7 +1,10 @@
+// Package memstore is an in-memory keyset.AdminStore, mainly for tests and
+// single-process use. Contents are lost when the process exits.
 package memstore
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"lds.li/keyset"
@@ -43,7 +46,14 @@ func (s *Store) Public(_ context.Context, name string) (keyset.Public, error) {
 	if !ok {
 		return keyset.Public{}, keyset.ErrNotFound
 	}
-	return keyset.UnmarshalPublic(entry.blob)
+	public, err := keyset.UnmarshalPublic(entry.blob)
+	if err != nil {
+		return keyset.Public{}, err
+	}
+	if public.Name != name {
+		return keyset.Public{}, fmt.Errorf("%w: stored public name %q does not match %q", keyset.ErrInvalid, public.Name, name)
+	}
+	return public, nil
 }
 
 func (s *Store) Read(_ context.Context, name string) (*keyset.Keyset, any, error) {
@@ -51,7 +61,7 @@ func (s *Store) Read(_ context.Context, name string) (*keyset.Keyset, any, error
 	defer s.mu.Unlock()
 	e, ok := s.entries[name]
 	if !ok {
-		return nil, int64(0), keyset.ErrNotFound
+		return nil, nil, keyset.ErrNotFound
 	}
 	ks, err := keyset.Unmarshal(name, e.blob, s.keeper)
 	if err != nil {

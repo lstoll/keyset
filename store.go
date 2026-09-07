@@ -2,7 +2,7 @@ package keyset
 
 import "context"
 
-// Store loads keysets for crypto clients.
+// Store loads keysets.
 type Store interface {
 	Get(ctx context.Context, name string) (*Keyset, error)
 	Public(ctx context.Context, name string) (Public, error)

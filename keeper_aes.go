@@ -6,6 +6,8 @@ import (
 	"fmt"
 )
 
+const aes256KeySize = 32
+
 // AES256GCMKeeper returns a Keeper from a 32-byte AES key.
 func AES256GCMKeeper(key []byte) (Keeper, error) {
 	if len(key) != aes256KeySize {
